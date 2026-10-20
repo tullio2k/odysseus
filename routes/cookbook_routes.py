@@ -1500,9 +1500,11 @@ def setup_cookbook_routes() -> APIRouter:
 	                    "is_video": m.get("is_video", False),
 	                    "is_adapter": m.get("is_adapter", False),
 	                    # Models scanned off disk carry no pipeline_tag, so the
-	                    # name marker is the only vision signal available here.
-	                    # Without it a VLM already on disk would still be routed
-	                    # to the text-only mlx_lm server.
+	                    # signals here are the checkpoint's own config.json, read
+	                    # by the scanner (`has_vision_config` — the scan also runs
+	                    # over SSH, where this process cannot see the filesystem),
+	                    # plus the name marker. Without them a VLM already on disk
+	                    # would still be routed to the text-only mlx_lm server.
 	                    "modality": vision_modality(m),
 	                }
                 if m.get("is_local_dir"):

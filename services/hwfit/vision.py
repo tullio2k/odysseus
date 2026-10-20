@@ -10,8 +10,9 @@ It matters because the serve logic has to route vision models to a server that
 accepts images. `mlx_lm.server` does not, so a vision checkpoint sent there
 comes up looking healthy with no way to pass it a picture.
 
-Two signals, because each is insufficient alone — measured over the 1553
-records in services/hwfit/data/:
+Three signals, because each is insufficient alone — the first two measured over
+the 1553 records in services/hwfit/data/, the third over 483 real config.json
+files (see VISION_CONFIG_KEY_PATTERN):
 
   * `pipeline_tag` marks 260 entries, but it is absent for anything scanned off
     disk and wrong on a few rows (`LFM2-VL-450M-6bit` ships tagged
@@ -19,6 +20,10 @@ records in services/hwfit/data/:
   * the name marker has near-perfect precision (5 of the 6 rows it flags
     against the tag are genuine VLMs) but only 32.3% recall (84/260): most VLMs
     carry no marker in the name at all, e.g. `gemma-3-27b-it-qat-4bit`.
+  * a vision tower in the checkpoint's own config.json is decisive (238/239 on
+    the sample behind VISION_CONFIG_KEY_PATTERN), but it exists only for a model
+    already downloaded, and only the scanner can read it — on a remote host the
+    route never sees that filesystem.
 
 So the rule is their OR, minus an explicit opt-out for checkpoints published
 with the vision tower stripped (`...-skip-vision`).
@@ -38,6 +43,46 @@ import os
 import re
 
 VISION_PIPELINE_TAG = "image-text-to-text"
+
+# A checkpoint on disk carries no pipeline_tag, and most VLM names carry no
+# marker, so for a model already downloaded the strong signal is its own
+# config.json: a vision-language model keeps a vision tower in there.
+#
+# The spelling varies by family, so this matches the class rather than listing
+# instances — `vision_config` (Qwen-VL, gemma, Mistral3, Llama 4),
+# `vit_config` (Ovis), `vision_lora` (Phi-4-multimodal), `mm_vision_tower`
+# (llava), `visual` (Qwen-VL gen 1), `vision_tower`.
+#
+# The value has to be a sub-config or a model reference, which is what a tower
+# looks like. A bare number named after vision is not one: the language-only
+# extractions mlx-community/gemma-3n-E4B-it-lm-{4bit,bf16} keep a
+# `vision_soft_tokens_per_image` scalar with no tower behind it, and are text.
+#
+# Measured by laying 483 real config.json files out as an HF cache and running
+# the scanner over them — every catalog entry tagged image-text-to-text whose
+# config could be fetched (239) plus a matched sample tagged text-generation
+# (244). This rule fires on 238/239 of the vision ones against 81/239 (33.9%)
+# for the name marker, and on 10 of the 244 text ones.
+#
+# Those ten look like catalog tag errors rather than detector errors, and for
+# most of them the catalogs contradict themselves: QuantTrio/Qwen3.6-{27B,35B-A3B}-AWQ
+# are tagged text-generation while cyankiwi's quantizations of the same two
+# models are tagged image-text-to-text, and mlx-community/Llama-4-Maverick-17B-16E
+# is tagged text-generation while upstream meta-llama/Llama-4-Maverick is not.
+# PE-Core-S16-384 is a CLIP-style vision encoder (a text_config and a
+# vision_config, no architectures), which is not a text model either. For the
+# four Mistral3ForConditionalGeneration rows the only evidence is the config
+# itself, which carries a vision_config and a vision_feature_layer.
+#
+# The one vision model still missed is mlx-community/Molmo-7B-D-0924-bf16, whose
+# config.json mentions no tower at all — it is behind trust_remote_code.
+#
+# Two cheaper-looking signals were measured and dropped: `architectures` ending
+# in ForConditionalGeneration adds no recall while matching text-only seq2seq
+# models such as T5ForConditionalGeneration, and an `image_token*` key adds
+# false positives, among them the text-only plamo-2-1b. `model_type` is
+# ambiguous in the catalogs — `lfm2` appears on 7 vision rows and 32 text ones.
+VISION_CONFIG_KEY_PATTERN = r"^(vision|visual|vit|mm_vision)(_|$)"
 
 # Tokens that identify a vision-language model by name. Each must appear as a
 # whole delimited token, so "navlm" or "revlon" do not match on "vl".
@@ -83,6 +128,11 @@ def is_vision_model(entry):
     modality = str(entry.get("modality") or "").strip().lower()
     if modality:
         return modality == "vision"
+    # Read off the checkpoint's own config.json by the disk scanner. It comes
+    # before the tag because it describes this exact checkpoint, while the tag
+    # is catalog metadata that is occasionally wrong about it.
+    if entry.get("has_vision_config") is True:
+        return True
     tag = str(entry.get("pipeline_tag") or "").strip().lower()
     if tag == VISION_PIPELINE_TAG:
         return True

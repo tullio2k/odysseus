@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from routes._validators import validate_remote_host, validate_ssh_port
 from core.platform_compat import _ssh_exec_argv
+from services.hwfit.vision import VISION_CONFIG_KEY_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +393,28 @@ def _cached_model_scan_script(model_dirs: list[str] | None = None, add_hf_cache:
         "    for root, dirs, fns in os.walk(top, followlinks=False):",
         "        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d)) and safe_path(os.path.join(root, d))]",
         "        yield root, dirs, fns",
+        # Interpolated from services/hwfit/vision.py so the rule stays in one
+        # place: the scanner reports the fact, vision.py decides what it means.
+        "VISION_CONFIG_KEY_RE = re.compile(" + repr(VISION_CONFIG_KEY_PATTERN) + ", re.IGNORECASE)",
+        "def config_is_vision(path):",
+        "    # A vision-language checkpoint keeps a vision tower in config.json.",
+        "    # The value has to look like a tower — a sub-config or a model",
+        "    # reference — since a language-only build can keep a stray scalar",
+        "    # named after vision (gemma-3n-...-lm has vision_soft_tokens_per_image).",
+        "    # Called once per model snapshot and only at its root: diffusion repos",
+        "    # keep a config.json per component, and an image_encoder's would flag",
+        "    # the whole pipeline.",
+        "    try:",
+        "        if os.path.getsize(path) > 4000000: return False",
+        "        with open(path, 'r', encoding='utf-8', errors='replace') as fh:",
+        "            data = json.load(fh)",
+        "    except Exception:",
+        "        return False",
+        "    if not isinstance(data, dict): return False",
+        "    for k, v in data.items():",
+        "        if not isinstance(k, str) or not VISION_CONFIG_KEY_RE.match(k): continue",
+        "        if isinstance(v, (dict, str)) and v: return True",
+        "    return False",
         "def gguf_role(name):",
         "    n = name.lower()",
         "    if n.startswith('mmproj') or 'mmproj' in n: return 'projector'",
@@ -465,11 +488,13 @@ def _cached_model_scan_script(model_dirs: list[str] | None = None, add_hf_cache:
         "            sz, nf, ic = sz2, nf2, ic or ic2",
         "        is_video = bool(re.search(r'(?i)(^|/)Lightricks/LTX-|(^|/)LTX[-_/]|video|text-to-video|image-to-video', rid))",
         "        is_diffusion = is_video; is_adapter = bool(re.search(r'(?i)(lora|adapter|peft|qlora|control[-_]?lora|diffusion[-_]?lora)', rid)); gguf_files = []",
+        "        has_vision_config = False",
         "        if os.path.isdir(snap):",
         "            for sd in os.listdir(snap):",
         "                sf = os.path.join(snap, sd)",
         "                if not os.path.isdir(sf): continue",
         "                if os.path.exists(os.path.join(sf, 'model_index.json')): is_diffusion = True",
+        "                if not has_vision_config and config_is_vision(os.path.join(sf, 'config.json')): has_vision_config = True",
         "                if os.path.exists(os.path.join(sf, 'adapter_config.json')) or os.path.exists(os.path.join(sf, 'adapter_model.safetensors')): is_adapter = True",
         "                for _root, _dirs, _fns in safe_walk(sf):",
         "                    for _fn in _fns:",
@@ -478,7 +503,7 @@ def _cached_model_scan_script(model_dirs: list[str] | None = None, add_hf_cache:
         "                        if _lfn in ('adapter_config.json','adapter_model.safetensors','pytorch_lora_weights.safetensors') or 'lora' in _lfn:",
         "                            is_adapter = True",
         "                for f in collect_ggufs(sf): f['rel_path'] = sd + '/' + f['rel_path']; gguf_files.append(f)",
-        "        models.append({'repo_id':rid,'size_bytes':sz,'nb_files':nf,'has_incomplete':ic,'path':cache,'is_diffusion':is_diffusion,'is_video':is_video,'is_adapter':is_adapter,'is_gguf':bool(gguf_files),'gguf_files':gguf_files})",
+        "        models.append({'repo_id':rid,'size_bytes':sz,'nb_files':nf,'has_incomplete':ic,'path':cache,'is_diffusion':is_diffusion,'is_video':is_video,'is_adapter':is_adapter,'is_gguf':bool(gguf_files),'gguf_files':gguf_files,'has_vision_config':has_vision_config})",
         "def hf_cache_paths():",
         "    candidates = []",
         "    def add(p):",
@@ -522,6 +547,7 @@ def _cached_model_scan_script(model_dirs: list[str] | None = None, add_hf_cache:
         "            if is_model: break",
         "        if not is_model: continue",
         "        gguf_files = collect_ggufs(fp)",
+        "        has_vision_config = config_is_vision(os.path.join(fp, 'config.json'))",
         "        seen.add(d)",
         "        sz, nf = 0, 0",
         "        for dp, _, fns in safe_walk(fp):",
@@ -529,7 +555,7 @@ def _cached_model_scan_script(model_dirs: list[str] | None = None, add_hf_cache:
         "                try: nf += 1; sz += os.path.getsize(os.path.join(dp, fn))",
         "                except Exception: pass",
         "        is_diff = os.path.exists(os.path.join(fp, 'model_index.json'))",
-        "        models.append({'repo_id':d,'size_bytes':sz,'nb_files':nf,'has_incomplete':False,'path':p,'is_local_dir':True,'is_diffusion':is_diff,'is_adapter':is_adapter,'is_gguf':bool(gguf_files),'gguf_files':gguf_files})",
+        "        models.append({'repo_id':d,'size_bytes':sz,'nb_files':nf,'has_incomplete':False,'path':p,'is_local_dir':True,'is_diffusion':is_diff,'is_adapter':is_adapter,'is_gguf':bool(gguf_files),'gguf_files':gguf_files,'has_vision_config':has_vision_config})",
         "def parse_size(num, unit):",
         "    try: n = float(num)",
         "    except Exception: return 0",
